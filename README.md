@@ -62,3 +62,22 @@ In order to run the full suite of Acceptance tests, run `make testacc`.
 ```shell
 make testacc
 ```
+
+## bjoernf's doc
+
+1. Login to github, find the terraform-provider-scaffolding-framework repository, and click the *Use this template* button.
+1. Clone your new repository to your local machine, and cd to it
+1. Run the following to rename the repository: `go mod edit -module terraform-provider-dryad`
+1. Run the following to install the provider's dependencies: `go mod tidy`
+1. In `main.go`, replace the line referring to *internal/provider* of the scaffolding-repository with your project, commented with `//THIS LINE` below
+    ```go 
+        import (
+            "context"
+            "flag"
+            "log"
+
+            "github.com/hashicorp/terraform-plugin-framework/providerserver"
+            "terraform-provider-dryad/internal/provider" //THIS LINE
+        )
+    ```
+1. bla bla
