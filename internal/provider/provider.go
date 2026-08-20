@@ -1,93 +1,265 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
-
 package provider
 
 import (
 	"context"
-	"net/http"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
-	"github.com/hashicorp/terraform-plugin-framework/function"
-	"github.com/hashicorp/terraform-plugin-framework/provider"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	frameworkprovider "github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/bjoernf73/dry.module.ad/tf/terraform-provider-dryad/internal/client"
+	"github.com/bjoernf73/dry.module.ad/tf/terraform-provider-dryad/internal/config"
 )
 
-// Ensure ScaffoldingProvider satisfies various provider interfaces.
-var _ provider.Provider = &ScaffoldingProvider{}
-var _ provider.ProviderWithFunctions = &ScaffoldingProvider{}
+var _ frameworkprovider.Provider = &dryadProvider{}
 
-// ScaffoldingProvider defines the provider implementation.
-type ScaffoldingProvider struct {
-	// version is set to the provider version on release, "dev" when the
-	// provider is built and ran locally, and "test" when running acceptance
-	// testing.
+func New(version string) func() frameworkprovider.Provider {
+	return func() frameworkprovider.Provider {
+		return &dryadProvider{
+			version: version,
+		}
+	}
+}
+
+type dryadProvider struct {
 	version string
 }
 
-// ScaffoldingProviderModel describes the provider data model.
-type ScaffoldingProviderModel struct {
-	Endpoint types.String `tfsdk:"endpoint"`
+type dryadProviderModel struct {
+	Host                types.String `tfsdk:"host"`
+	Port                types.Int64  `tfsdk:"port"`
+	Transport           types.String `tfsdk:"transport"`
+	Username            types.String `tfsdk:"username"`
+	Password            types.String `tfsdk:"password"`
+	Insecure            types.Bool   `tfsdk:"insecure"`
+	PowerShellPath      types.String `tfsdk:"powershell_path"`
+	DomainController    types.String `tfsdk:"domain_controller"`
+	TimeoutSeconds      types.Int64  `tfsdk:"timeout_seconds"`
+	WinRMUseTLS         types.Bool   `tfsdk:"winrm_use_tls"`
+	WinRMAuth           types.String `tfsdk:"winrm_auth"`
+	WinRMKerberosRealm  types.String `tfsdk:"winrm_kerberos_realm"`
+	WinRMKerberosConfig types.String `tfsdk:"winrm_kerberos_config_path"`
+	WinRMKerberosSPN    types.String `tfsdk:"winrm_kerberos_spn"`
+	WinRMKerberosCCache types.String `tfsdk:"winrm_kerberos_ccache_path"`
+	SSHPrivateKeyPEM    types.String `tfsdk:"ssh_private_key_pem"`
+	SSHKnownHostsPath   types.String `tfsdk:"ssh_known_hosts_path"`
+	SSHHostKey          types.String `tfsdk:"ssh_host_key"`
 }
 
-func (p *ScaffoldingProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
-	resp.TypeName = "scaffolding"
+func (p *dryadProvider) Metadata(_ context.Context, _ frameworkprovider.MetadataRequest, resp *frameworkprovider.MetadataResponse) {
+	resp.TypeName = "dryad"
 	resp.Version = p.version
 }
 
-func (p *ScaffoldingProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *dryadProvider) Schema(_ context.Context, _ frameworkprovider.SchemaRequest, resp *frameworkprovider.SchemaResponse) {
 	resp.Schema = schema.Schema{
+		MarkdownDescription: "The dryad provider manages Active Directory objects by executing PowerShell 7 commands on remote Windows systems over WinRM or SSH.",
 		Attributes: map[string]schema.Attribute{
-			"endpoint": schema.StringAttribute{
-				MarkdownDescription: "Example provider attribute",
+			"host": schema.StringAttribute{
+				Required:            true,
+				MarkdownDescription: "Remote Windows host to connect to.",
+			},
+			"port": schema.Int64Attribute{
 				Optional:            true,
+				MarkdownDescription: "Remote port. Defaults to 5985 or 5986 for WinRM, and 22 for SSH.",
+			},
+			"transport": schema.StringAttribute{
+				Required:            true,
+				MarkdownDescription: "Connection transport: `winrm` or `ssh`.",
+			},
+			"username": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Remote account username.",
+			},
+			"password": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				MarkdownDescription: "Remote account password. Used by WinRM and optional for SSH.",
+			},
+			"insecure": schema.BoolAttribute{
+				Optional:            true,
+				MarkdownDescription: "Skip certificate validation for WinRM TLS or host key validation for SSH.",
+			},
+			"powershell_path": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "PowerShell 7 executable path on the remote Windows host. Defaults to `pwsh`.",
+			},
+			"domain_controller": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Optional domain controller to pass to Active Directory cmdlets via `-Server`.",
+			},
+			"timeout_seconds": schema.Int64Attribute{
+				Optional:            true,
+				MarkdownDescription: "Connection timeout in seconds. Defaults to 30.",
+			},
+			"winrm_use_tls": schema.BoolAttribute{
+				Optional:            true,
+				MarkdownDescription: "Use HTTPS/TLS for WinRM.",
+			},
+			"winrm_auth": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "WinRM authentication mechanism: `basic`, `ntlm`, or `kerberos`. Defaults to `basic`.",
+			},
+			"winrm_kerberos_realm": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Kerberos realm for WinRM Kerberos authentication.",
+			},
+			"winrm_kerberos_config_path": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Path to `krb5.conf` on the machine running Terraform.",
+			},
+			"winrm_kerberos_spn": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Optional Kerberos SPN override. Defaults to `HTTP/<host>`.",
+			},
+			"winrm_kerberos_ccache_path": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Optional Kerberos credential cache path on the machine running Terraform.",
+			},
+			"ssh_private_key_pem": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				MarkdownDescription: "PEM-encoded private key used for SSH authentication.",
+			},
+			"ssh_known_hosts_path": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Known hosts file for SSH host key verification.",
+			},
+			"ssh_host_key": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Authorized-key formatted SSH host public key.",
 			},
 		},
 	}
 }
 
-func (p *ScaffoldingProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
-	var data ScaffoldingProviderModel
-
+func (p *dryadProvider) Configure(ctx context.Context, req frameworkprovider.ConfigureRequest, resp *frameworkprovider.ConfigureResponse) {
+	var data dryadProviderModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
-
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Configuration values are now available.
-	// if data.Endpoint.IsNull() { /* ... */ }
+	cfg, diags := expandProviderConfig(data)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-	// Example client configuration for data sources and resources
-	client := http.DefaultClient
-	resp.DataSourceData = client
-	resp.ResourceData = client
+	dryadClient, err := client.New(cfg)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to create dryad client", err.Error())
+		return
+	}
+
+	resp.DataSourceData = dryadClient
+	resp.ResourceData = dryadClient
 }
 
-func (p *ScaffoldingProvider) Resources(ctx context.Context) []func() resource.Resource {
+func (p *dryadProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		NewExampleResource,
+		NewOrganizationalUnitResource,
 	}
 }
 
-func (p *ScaffoldingProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{
-		NewExampleDataSource,
-	}
+func (p *dryadProvider) DataSources(_ context.Context) []func() datasource.DataSource {
+	return nil
 }
 
-func (p *ScaffoldingProvider) Functions(ctx context.Context) []func() function.Function {
-	return []func() function.Function{
-		NewExampleFunction,
-	}
-}
+func expandProviderConfig(data dryadProviderModel) (config.Config, diag.Diagnostics) {
+	var diags diag.Diagnostics
 
-func New(version string) func() provider.Provider {
-	return func() provider.Provider {
-		return &ScaffoldingProvider{
-			version: version,
+	cfg := config.Config{
+		Host:                strings.TrimSpace(data.Host.ValueString()),
+		Transport:           strings.ToLower(strings.TrimSpace(data.Transport.ValueString())),
+		Username:            strings.TrimSpace(data.Username.ValueString()),
+		Password:            data.Password.ValueString(),
+		Insecure:            valueOrDefaultBool(data.Insecure, false),
+		PowerShellPath:      valueOrDefaultString(data.PowerShellPath, "pwsh"),
+		DomainController:    strings.TrimSpace(data.DomainController.ValueString()),
+		Timeout:             time.Duration(valueOrDefaultInt64(data.TimeoutSeconds, 30)) * time.Second,
+		WinRMUseTLS:         valueOrDefaultBool(data.WinRMUseTLS, false),
+		WinRMAuth:           strings.ToLower(valueOrDefaultString(data.WinRMAuth, "basic")),
+		WinRMKerberosRealm:  strings.TrimSpace(data.WinRMKerberosRealm.ValueString()),
+		WinRMKerberosConfig: strings.TrimSpace(data.WinRMKerberosConfig.ValueString()),
+		WinRMKerberosSPN:    strings.TrimSpace(data.WinRMKerberosSPN.ValueString()),
+		WinRMKerberosCCache: strings.TrimSpace(data.WinRMKerberosCCache.ValueString()),
+		SSHPrivateKeyPEM:    data.SSHPrivateKeyPEM.ValueString(),
+		SSHKnownHostsPath:   strings.TrimSpace(data.SSHKnownHostsPath.ValueString()),
+		SSHHostKey:          strings.TrimSpace(data.SSHHostKey.ValueString()),
+	}
+
+	if cfg.Host == "" {
+		diags.AddError("Missing host", "host must not be empty.")
+	}
+
+	switch cfg.Transport {
+	case "winrm":
+		if cfg.Username == "" {
+			diags.AddError("Missing username", "username is required for WinRM transport.")
 		}
+
+		if cfg.WinRMAuth != "kerberos" && cfg.Password == "" {
+			diags.AddError("Missing password", "password is required for WinRM basic and NTLM authentication.")
+		}
+
+		if cfg.WinRMAuth == "kerberos" && cfg.WinRMKerberosRealm == "" && cfg.WinRMKerberosCCache == "" {
+			diags.AddError("Missing Kerberos realm", "winrm_kerberos_realm or winrm_kerberos_ccache_path is required for Kerberos authentication.")
+		}
+
+		if data.Port.IsNull() || data.Port.IsUnknown() {
+			if cfg.WinRMUseTLS {
+				cfg.Port = 5986
+			} else {
+				cfg.Port = 5985
+			}
+		} else {
+			cfg.Port = int(data.Port.ValueInt64())
+		}
+	case "ssh":
+		if cfg.Username == "" {
+			diags.AddError("Missing username", "username is required for SSH transport.")
+		}
+
+		if cfg.Password == "" && strings.TrimSpace(cfg.SSHPrivateKeyPEM) == "" {
+			diags.AddError("Missing SSH credentials", "password or ssh_private_key_pem is required for SSH transport.")
+		}
+
+		if data.Port.IsNull() || data.Port.IsUnknown() {
+			cfg.Port = 22
+		} else {
+			cfg.Port = int(data.Port.ValueInt64())
+		}
+	default:
+		diags.AddError("Unsupported transport", fmt.Sprintf("transport %q is not supported; use `winrm` or `ssh`.", cfg.Transport))
 	}
+
+	return cfg, diags
+}
+
+func valueOrDefaultString(value types.String, fallback string) string {
+	if value.IsNull() || value.IsUnknown() {
+		return fallback
+	}
+	return strings.TrimSpace(value.ValueString())
+}
+
+func valueOrDefaultBool(value types.Bool, fallback bool) bool {
+	if value.IsNull() || value.IsUnknown() {
+		return fallback
+	}
+	return value.ValueBool()
+}
+
+func valueOrDefaultInt64(value types.Int64, fallback int64) int64 {
+	if value.IsNull() || value.IsUnknown() {
+		return fallback
+	}
+	return value.ValueInt64()
 }
